@@ -1,0 +1,445 @@
+// ====================================================================
+// Anggun VERSI 2.2: PETA KERAWANAN BANJIR KABUPATEN DEMAK
+// ====================================================================
+
+// 1. DEFINISI AREA OF INTEREST (AOI)
+var aoi = ee.FeatureCollection("FAO/GAUL/2015/level2")
+            .filter(ee.Filter.eq('ADM1_NAME', 'Jawa Tengah'))
+            .filter(ee.Filter.eq('ADM2_NAME', 'Demak'))
+            .first().geometry();
+
+Map.centerObject(aoi, 10);
+Map.setOptions('HYBRID');
+
+// Palet Warna untuk Visualisasi Kerawanan
+var palette_kerawanan = [
+  '0c27e0', // Biru gelap (1)
+  '2f6dff', // Biru muda (2)
+  'ffeb44', // Kuning (3)
+  'ff8e1a', // Orange (4)
+  'ff0000'  // Merah (5)
+];
+var vizParams = {min: 1, max: 5, palette: palette_kerawanan};
+
+// ====================================================================
+// 2. DATA FAKTOR KERAWANAN & RECLASSIFICATION
+// ====================================================================
+
+// DATA DASAR - Gunakan DEM yang lebih akurat
+var dem = ee.Image("NASA/NASADEM_HGT/001")
+            .select('elevation')
+            .clip(aoi);
+
+print('Elevasi DEM - Min, Max:', dem.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e10
+}));
+
+// A. FAKTOR 1: ELEVASI (KETINGGIAN) - Disesuaikan untuk Demak
+var elev_reclass = ee.Image(1)
+    .where(dem.lt(2), 5)      // < 2m : Sangat Rawan
+    .where(dem.gte(2).and(dem.lt(5)), 4)   // 2-5m
+    .where(dem.gte(5).and(dem.lt(10)), 3)  // 5-10m
+    .where(dem.gte(10).and(dem.lt(20)), 2) // 10-20m
+    .where(dem.gte(20), 1)                 // > 20m
+    .rename('Elevation_Factor')
+    .clip(aoi);
+
+Map.addLayer(elev_reclass, vizParams, 'Faktor 1: Elevasi', false);
+
+// B. FAKTOR 2: KEMIRINGAN (SLOPE)
+var slope = ee.Terrain.slope(dem).clip(aoi);
+var slope_reclass = ee.Image(1)
+    .where(slope.lt(1), 5)       // < 1° : Sangat Rawan (rata)
+    .where(slope.gte(1).and(slope.lt(3)), 4)   // 1-3°
+    .where(slope.gte(3).and(slope.lt(5)), 3)   // 3-5°
+    .where(slope.gte(5).and(slope.lt(10)), 2)  // 5-10°
+    .where(slope.gte(10), 1)                   // > 10°
+    .rename('Slope_Factor')
+    .clip(aoi);
+
+Map.addLayer(slope_reclass, vizParams, 'Faktor 2: Kemiringan', false);
+
+// C. FAKTOR 3: JARAK DARI BADAN AIR
+// Gunakan JRC Global Surface Water
+var water_bodies = ee.Image('JRC/GSW1_4/GlobalSurfaceWater')
+    .select('occurrence')
+    .clip(aoi);
+
+// Buat mask air (occurrence > 50 berarti perairan permanen)
+var water_mask = water_bodies.gt(50);
+
+// Hitung jarak ke badan air (dalam meter)
+var distance_to_water = water_mask
+    .fastDistanceTransform()
+    .sqrt()
+    .multiply(30); // Konversi dari pixel ke meter
+
+print('Jarak ke Air - Statistik:', distance_to_water.reduceRegion({
+  reducer: ee.Reducer.percentile([0, 25, 50, 75, 100]),
+  geometry: aoi,
+  scale: 100,
+  maxPixels: 1e10
+}));
+
+var dist_reclass = ee.Image(1)
+    .where(distance_to_water.lt(300), 5)      // < 300m : Sangat Rawan
+    .where(distance_to_water.gte(300).and(distance_to_water.lt(600)), 4)
+    .where(distance_to_water.gte(600).and(distance_to_water.lt(1200)), 3)
+    .where(distance_to_water.gte(1200).and(distance_to_water.lt(2400)), 2)
+    .where(distance_to_water.gte(2400), 1)
+    .rename('Distance_Factor')
+    .clip(aoi);
+
+Map.addLayer(dist_reclass, vizParams, 'Faktor 3: Jarak dari Badan Air', false);
+
+// D. FAKTOR 4: TUTUPAN LAHAN - ESA WorldCover
+var lc = ee.Image('ESA/WorldCover/v100/2020').select('Map').clip(aoi);
+
+// Reklasifikasi khusus untuk Demak
+var lc_reclass = lc.remap(
+    [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100], // Original classes
+    [2,  2,  3,  3,  5,  4,  3,  4,  1,  2,  3]    // Adjusted scores
+    // 10: Tree cover, 20: Shrubland → 2
+    // 50: Built-up → 5 (sangat rawan)
+    // 80: Cropland → 4 (rawan - sawah)
+    // 90: Water → 1 (tidak rawan)
+    // 95: Wetlands → 2 (sedang rendah)
+).rename('Landcover_Factor');
+
+Map.addLayer(lc_reclass, vizParams, 'Faktor 4: Tutupan Lahan', false);
+
+// E. FAKTOR 5: CURAH HUJAN - Metode yang lebih robust
+var precip_collection = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+    .filterDate('2023-01-01', '2023-12-31')
+    .filterBounds(aoi);
+
+// Hitung total curah hujan tahunan
+var precip_total = precip_collection.sum().clip(aoi);
+
+// Dapatkan statistik dengan nama band yang benar
+var precip_stats = precip_total.reduceRegion({
+  reducer: ee.Reducer.percentile([10, 25, 50, 75, 90]),
+  geometry: aoi,
+  scale: 1000,
+  maxPixels: 1e10
+});
+
+// Cek nama band yang benar
+print('Nama band curah hujan:', precip_total.bandNames());
+print('Statistik Curah Hujan:', precip_stats);
+
+// Gunakan pendekatan yang lebih sederhana untuk menghindari error
+var precip_mean = precip_total.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: aoi,
+  scale: 1000,
+  maxPixels: 1e10
+}).get('precipitation');
+
+print('Rata-rata Curah Hujan Tahunan:', precip_mean);
+
+// Reklasifikasi berdasarkan nilai absolut (sesuai kondisi Demak)
+var rh_reclass = ee.Image(1)
+    .where(precip_total.lt(1000), 1)   // < 1000 mm/tahun
+    .where(precip_total.gte(1000).and(precip_total.lt(1200)), 2)
+    .where(precip_total.gte(1200).and(precip_total.lt(1400)), 3)
+    .where(precip_total.gte(1400).and(precip_total.lt(1600)), 4)
+    .where(precip_total.gte(1600), 5)  // > 1600 mm/tahun
+    .rename('Rainfall_Factor')
+    .clip(aoi);
+
+Map.addLayer(rh_reclass, vizParams, 'Faktor 5: Curah Hujan', false);
+
+// ====================================================================
+// 3. OVERLAY BERBOBOT (PENENTUAN BOBOT AHP SIMULASI)
+// ====================================================================
+
+// BOBOT SIMULASI untuk Demak
+var W_ELEV = 0.35;    // Paling penting (daerah rendah)
+var W_DIST = 0.25;    // Jarak dari sungai/laut
+var W_PRECIP = 0.20;  // Curah hujan
+var W_LC = 0.15;      // Tutupan lahan
+var W_SLOPE = 0.05;   // Kurang penting karena datar
+
+print('=== BOBOT FAKTOR ===');
+print('Elevasi: ' + (W_ELEV * 100) + '%');
+print('Jarak Air: ' + (W_DIST * 100) + '%');
+print('Curah Hujan: ' + (W_PRECIP * 100) + '%');
+print('Tutupan Lahan: ' + (W_LC * 100) + '%');
+print('Kemiringan: ' + (W_SLOPE * 100) + '%');
+print('Total Bobot: ' + ((W_ELEV + W_DIST + W_PRECIP + W_LC + W_SLOPE) * 100) + '%');
+
+// Hitung Peta Kerawanan Banjir (FSM) - Pastikan semua faktor sudah di-clip
+var fsm = elev_reclass.multiply(W_ELEV)
+    .add(slope_reclass.multiply(W_SLOPE))
+    .add(dist_reclass.multiply(W_DIST))
+    .add(lc_reclass.multiply(W_LC))
+    .add(rh_reclass.multiply(W_PRECIP))
+    .rename('Flood_Susceptibility_Score');
+
+// Dapatkan nilai min dan max untuk normalisasi
+var fsm_stats = fsm.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e10,
+  tileScale: 4
+});
+
+print('Skor Kerawanan - Min Max:', fsm_stats);
+
+// Normalisasi ke skala 1-5
+var fsm_min = ee.Number(fsm_stats.get('Flood_Susceptibility_Score_min'));
+var fsm_max = ee.Number(fsm_stats.get('Flood_Susceptibility_Score_max'));
+
+var fsm_normalized = fsm.subtract(fsm_min)
+    .divide(fsm_max.subtract(fsm_min))
+    .multiply(4)  // Skala 0-4
+    .add(1)       // Skala 1-5
+    .round()
+    .clamp(1, 5)  // Pastikan antara 1-5
+    .int()
+    .rename('Flood_Susceptibility_Class');
+
+var fsm_final = fsm_normalized.clip(aoi);
+
+// ====================================================================
+// 4. ANALISIS STATISTIK DAN VALIDASI
+// ====================================================================
+
+// Hitung luas masing-masing kelas
+var area_stats = fsm_final.addBands(ee.Image.pixelArea())
+    .reduceRegion({
+      reducer: ee.Reducer.sum().group({
+        groupField: 1,
+        groupName: 'class'
+      }),
+      geometry: aoi,
+      scale: 30,
+      maxPixels: 1e10,
+      tileScale: 4
+    });
+
+// Konversi hasil ke format yang lebih mudah dibaca
+var stats_list = ee.List(area_stats.get('groups'));
+
+// Fungsi untuk menghitung persentase
+var calculatePercentages = function(group) {
+  group = ee.Dictionary(group);
+  var area = ee.Number(group.get('sum'));
+  var total_area = aoi.area();
+  var percentage = area.divide(total_area).multiply(100);
+  return group.set('area_m2', area)
+             .set('percentage', percentage)
+             .set('area_km2', area.divide(1e6));
+};
+
+var detailed_stats = stats_list.map(calculatePercentages);
+print('Statistik Luas Kelas Kerawanan:', detailed_stats);
+
+// ====================================================================
+// 5. VISUALISASI
+// ====================================================================
+
+Map.addLayer(fsm_final, vizParams, 'PETA KERAWANAN BANJIR DEMAK');
+
+// Tambahkan layer tambahan untuk referensi
+Map.addLayer(dem, {min: 0, max: 50, palette: ['blue', 'lightblue', 'green', 'yellow', 'brown']}, 'DEM (0-50m)', false);
+Map.addLayer(water_mask, {palette: 'blue'}, 'Badan Air Permanen', false);
+
+// --- Legenda ---
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '10px 15px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    border: '2px solid #333'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'PETA KERAWANAN BANJIR KABUPATEN DEMAK',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '0 0 10px 0',
+    padding: '0',
+    textAlign: 'center',
+    color: '#000'
+  }
+});
+
+legend.add(legendTitle);
+
+// Buat baris legenda
+for (var i = 0; i < 5; i++) {
+  var kelas = 5 - i; // Dari 5 ke 1
+  var label = '';
+  var deskripsi = '';
+  
+  if (kelas === 5) {
+    label = 'SANGAT TINGGI';
+    deskripsi = 'Rawan banjir parah';
+  } else if (kelas === 4) {
+    label = 'TINGGI';
+    deskripsi = 'Rawan banjir';
+  } else if (kelas === 3) {
+    label = 'SEDANG';
+    deskripsi = 'Cukup rawan';
+  } else if (kelas === 2) {
+    label = 'RENDAH';
+    deskripsi = 'Kurang rawan';
+  } else {
+    label = 'SANGAT RENDAH';
+    deskripsi = 'Tidak rawan';
+  }
+  
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: palette_kerawanan[4-i],
+      padding: '12px',
+      margin: '0 5px 0 0',
+      border: '1px solid #000'
+    }
+  });
+  
+  var kelasLabel = ui.Label({
+    value: kelas + '. ' + label,
+    style: {
+      fontWeight: 'bold',
+      margin: '0 10px 0 5px',
+      width: '120px'
+    }
+  });
+  
+  var descLabel = ui.Label({
+    value: deskripsi,
+    style: {
+      fontSize: '12px',
+      color: '#444'
+    }
+  });
+  
+  var row = ui.Panel({
+    widgets: [colorBox, kelasLabel, descLabel],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+  
+  legend.add(row);
+}
+
+Map.add(legend);
+
+// ====================================================================
+// 6. PANEL INFORMASI
+// ====================================================================
+
+var infoPanel = ui.Panel({
+  widgets: [
+    ui.Label('ANALISIS KERAWANAN BANJIR DEMAK', {
+      fontWeight: 'bold',
+      fontSize: '16px',
+      margin: '0 0 10px 0'
+    }),
+    ui.Label('Faktor yang digunakan:', {fontWeight: 'bold'}),
+    ui.Label('1. Elevasi/Topografi (35%)'),
+    ui.Label('2. Jarak dari Badan Air (25%)'),
+    ui.Label('3. Curah Hujan Tahunan (20%)'),
+    ui.Label('4. Tutupan Lahan (15%)'),
+    ui.Label('5. Kemiringan Lereng (5%)'),
+    ui.Label('', {margin: '10px 0 0 0'}),
+    ui.Label('Sumber Data:', {fontWeight: 'bold'}),
+    ui.Label('- NASA NASADEM (Elevasi)'),
+    ui.Label('- JRC Global Surface Water'),
+    ui.Label('- ESA WorldCover 2020'),
+    ui.Label('- CHIRPS Daily (Curah Hujan)')
+  ],
+  style: {
+    position: 'top-right',
+    padding: '15px',
+    backgroundColor: 'rgba(255,255,255,0.85)',
+    border: '2px solid #333',
+    maxWidth: '300px'
+  }
+});
+
+Map.add(infoPanel);
+
+// ====================================================================
+// 7. EXPORT DATA
+// ====================================================================
+
+// Export peta kerawanan utama
+Export.image.toDrive({
+  image: fsm_final,
+  description: 'Peta_Kerawanan_Banjir_Demak_Final',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e10,
+  folder: 'GEE_Demak',
+  fileFormat: 'GeoTIFF',
+  crs: 'EPSG:4326'
+});
+
+// Export semua faktor sebagai mosaic
+var all_factors = ee.Image.cat([
+  elev_reclass,
+  slope_reclass,
+  dist_reclass,
+  lc_reclass,
+  rh_reclass,
+  fsm_final
+]).rename(['elevasi', 'kemiringan', 'jarak_air', 'tutupan_lahan', 'curah_hujan', 'kerawanan']);
+
+Export.image.toDrive({
+  image: all_factors,
+  description: 'Semua_Faktor_Kerawanan_Demak',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e10,
+  folder: 'GEE_Demak',
+  fileFormat: 'GeoTIFF',
+  crs: 'EPSG:4326'
+});
+
+// Export data statistik sebagai CSV
+var stats_for_export = ee.FeatureCollection([
+  ee.Feature(null, {
+    'total_area_km2': aoi.area().divide(1e6),
+    'analysis_date': ee.Date(Date.now()).format('YYYY-MM-dd')
+  })
+]);
+
+Export.table.toDrive({
+  collection: stats_for_export,
+  description: 'Statistik_Area_Demak',
+  folder: 'GEE_Demak',
+  fileFormat: 'CSV'
+});
+
+// ====================================================================
+// 8. INSTRUKSI DAN OUTPUT
+// ====================================================================
+
+print('=== INSTRUKSI PENGGUNAAN ===');
+print('1. Klik RUN untuk memulai analisis');
+print('2. Cek Console untuk melihat statistik');
+print('3. Layer dapat di-toggle di panel Layers');
+print('4. Export akan muncul di Tasks panel');
+print('5. Tunggu hingga semua proses selesai sebelum export');
+
+print('=== TIPS PENELITIAN ===');
+print('1. Validasi dengan data historis banjir BNPB/Pusdalops');
+print('2. Lakukan survei lapangan untuk ground truth');
+print('3. Bandingkan dengan peta RBI skala 1:25.000');
+print('4. Gunakan data curah hujan lokal jika tersedia');
+print('5. Pertimbangkan faktor antropogenik (drainase, bendungan)');
+
+print('=== INFORMASI TEKNIS ===');
+print('Skala Analisis: 30 meter');
+print('Sistem Koordinat: WGS84 (EPSG:4326)');
+print('Metode: Weighted Overlay (MCDA)');
+print('Rentang Skor: 1-5 (Sangat Rendah - Sangat Tinggi)');
